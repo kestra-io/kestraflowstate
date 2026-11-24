@@ -1,0 +1,174 @@
+id: jaffle_shop_insights_kestra_hackathon
+namespace: kestra.devrel
+
+description: |
+  Kestra hackathon starter flow: Jaffle Shop insights.
+
+  This flow downloads the Jaffle Shop dataset (a fictional chain of sandwich & coffee
+  shops) over HTTP, analyzes it with DuckDB, and produces:
+    1. a business overview in the logs,
+    2. a store leaderboard in the logs,
+    3. a CSV report of the most profitable products, available in the Outputs tab.
+
+  No credentials or setup needed: just click Execute.
+  Prices in the raw data are stored in cents, so we divide by 100 to get dollars.
+
+labels:
+  event: hackathon
+  dataset: jaffle-shop
+
+# Inputs are parameters you can change each time you run the flow.
+inputs:
+  - id: top_n
+    type: INT
+    displayName: How many products should the report include? (1-10)
+    description: The Jaffle Shop menu has 10 products (5 jaffles and 5 beverages).
+    defaults: 5
+    min: 1
+    max: 10
+
+# Variables are reusable values. Reference them with {{ vars.name }}.
+variables:
+  data_url: https://huggingface.co/datasets/annageller/kestra/resolve/main/jaffle-data
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # STEP 1 - EXTRACT: download the raw CSV files.
+  # Each Download task stores its file in Kestra's internal storage and exposes
+  # it to later tasks as {{ outputs.<task_id>.uri }}.
+  # ---------------------------------------------------------------------------
+  - id: download_orders
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.data_url }}/raw_orders.csv"
+
+  - id: download_stores
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.data_url }}/raw_stores.csv"
+
+  - id: download_items
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.data_url }}/raw_items.csv"
+
+  - id: download_products
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.data_url }}/raw_products.csv"
+
+  - id: download_supplies
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.data_url }}/raw_supplies.csv"
+
+  # ---------------------------------------------------------------------------
+  # STEP 2 - ANALYZE: query the files with DuckDB, an in-process SQL engine.
+  # `inputFiles` copies files from previous tasks into the task's working
+  # directory, so SQL can read them with read_csv_auto().
+  # `fetchType` controls what happens with the result:
+  #   FETCH_ONE -> first row available as {{ outputs.<task_id>.row }}
+  #   FETCH     -> all rows available as {{ outputs.<task_id>.rows }}
+  #   STORE     -> rows saved to a file at {{ outputs.<task_id>.uri }}
+  # ---------------------------------------------------------------------------
+  - id: business_overview
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      orders.csv: "{{ outputs.download_orders.uri }}"
+    sql: |
+      SELECT
+        COUNT(*)                              AS total_orders,
+        COUNT(DISTINCT customer)              AS total_customers,
+        ROUND(SUM(order_total) / 100.0, 2)    AS total_revenue_usd,
+        ROUND(AVG(order_total) / 100.0, 2)    AS avg_order_usd,
+        CAST(MIN(ordered_at) AS DATE)::VARCHAR AS first_order_date,
+        CAST(MAX(ordered_at) AS DATE)::VARCHAR AS last_order_date
+      FROM read_csv_auto('{{ workingDir }}/orders.csv')
+    fetchType: FETCH_ONE
+
+  - id: store_leaderboard
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      orders.csv: "{{ outputs.download_orders.uri }}"
+      stores.csv: "{{ outputs.download_stores.uri }}"
+    sql: |
+      SELECT
+        s.name                                  AS store,
+        COUNT(*)                                AS orders,
+        ROUND(SUM(o.order_total) / 100.0, 2)    AS revenue_usd,
+        ROUND(AVG(o.order_total) / 100.0, 2)    AS avg_order_usd,
+        MODE(DAYNAME(o.ordered_at))             AS busiest_weekday
+      FROM read_csv_auto('{{ workingDir }}/orders.csv') AS o
+      JOIN read_csv_auto('{{ workingDir }}/stores.csv') AS s
+        ON o.store_id = s.id
+      GROUP BY s.name
+      ORDER BY revenue_usd DESC
+    fetchType: FETCH
+
+  - id: product_profitability
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    inputFiles:
+      items.csv: "{{ outputs.download_items.uri }}"
+      products.csv: "{{ outputs.download_products.uri }}"
+      supplies.csv: "{{ outputs.download_supplies.uri }}"
+    sql: |
+      -- A product's unit cost is the sum of the supplies used to make it
+      WITH unit_cost AS (
+        SELECT sku, SUM(cost) AS cost_cents
+        FROM read_csv_auto('{{ workingDir }}/supplies.csv')
+        GROUP BY sku
+      ),
+      units_sold AS (
+        SELECT sku, COUNT(*) AS units
+        FROM read_csv_auto('{{ workingDir }}/items.csv')
+        GROUP BY sku
+      )
+      SELECT
+        p.name                                                    AS product,
+        p.type                                                    AS product_type,
+        ROUND(p.price / 100.0, 2)                                 AS price_usd,
+        ROUND(c.cost_cents / 100.0, 2)                            AS unit_cost_usd,
+        ROUND(100.0 * (p.price - c.cost_cents) / p.price, 1)      AS margin_pct,
+        u.units                                                   AS units_sold,
+        ROUND(u.units * p.price / 100.0, 2)                       AS revenue_usd,
+        ROUND(u.units * (p.price - c.cost_cents) / 100.0, 2)      AS gross_profit_usd
+      FROM read_csv_auto('{{ workingDir }}/products.csv') AS p
+      JOIN units_sold AS u ON p.sku = u.sku
+      JOIN unit_cost  AS c ON p.sku = c.sku
+      ORDER BY gross_profit_usd DESC
+      LIMIT {{ inputs.top_n }}
+    fetchType: STORE
+
+  # ---------------------------------------------------------------------------
+  # STEP 3 - EXPORT: convert the stored result (Kestra's ION format) to CSV.
+  # ---------------------------------------------------------------------------
+  - id: report_to_csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    from: "{{ outputs.product_profitability.uri }}"
+
+  # ---------------------------------------------------------------------------
+  # STEP 4 - REPORT: print a summary in the Logs tab.
+  # ---------------------------------------------------------------------------
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      JAFFLE SHOP INSIGHTS
+      Period: {{ outputs.business_overview.row.first_order_date }} to {{ outputs.business_overview.row.last_order_date }}
+      Orders: {{ outputs.business_overview.row.total_orders }} from {{ outputs.business_overview.row.total_customers }} customers
+      Revenue: ${{ outputs.business_overview.row.total_revenue_usd }} (avg order ${{ outputs.business_overview.row.avg_order_usd }})
+
+      STORE LEADERBOARD
+      {%- for s in outputs.store_leaderboard.rows %}
+      {{ loop.index + 1 }}. {{ s.store }}: ${{ s.revenue_usd }} from {{ s.orders }} orders (avg ${{ s.avg_order_usd }}, busiest on {{ s.busiest_weekday }}s)
+      {%- endfor %}
+
+      Top {{ inputs.top_n }} products by gross profit: open the Outputs tab and download `product_report`.
+
+# Flow outputs appear in the execution's Outputs tab, ready to download.
+outputs:
+  - id: product_report
+    type: FILE
+    value: "{{ outputs.report_to_csv.uri }}"
+
+# Triggers run the flow automatically. This one is disabled: set `disabled: false`
+# to get a fresh report every Monday at 9:00.
+triggers:
+  - id: every_monday
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 * * 1"
+    disabled: true
