@@ -1,7 +1,6 @@
 id: jaffle_shop_insights_kestra_hackathon_ai
 namespace: kestra.devrel
 
-
 description: |
   Kestra hackathon starter flow (AI track): Jaffle Shop AI briefing.
 
@@ -13,7 +12,7 @@ description: |
 
   ONE-TIME SETUP (about 2 minutes, free):
     1. Get a free Gemini API key at https://aistudio.google.com/apikey
-    2. In Kestra, open Namespaces > yourNamespce.Name > KV Store > Create
+    2. In Kestra, open Namespaces > <your namespace> > KV Store > Create
        Key: GEMINI_API_KEY    Type: STRING    Value: <your key>
     3. Click Execute.
 
