@@ -1,15 +1,6 @@
-# Syncs every flow in flows/ into target_namespace, then (optionally) runs every flow in that namespace.
-# No checks: use safe_sync_and_run_kestraflowstate for a version that scans the flows first.
-#
-# Setup (Kestra 2.0):
-# - Plugins: git, plus whatever the synced flows use (the current ones need jdbc-duckdb, serdes and ai).
-# - Secret KESTRA_API_TOKEN in this flow's namespace: SyncFlows and the flow listing call the Kestra API with it.
-# - vars.kestra_url must reach the Kestra webserver from the worker.
-# - Flows run with their input defaults, so a flow with a required input that has no default will fail.
-#   Each run is allowFailure in its own Loop iteration, so one failing flow doesn't stop the others or fail
-#   this execution. Check each flow's own execution in target_namespace for its result.
 id: sync_and_run_kestraflowstate
 namespace: kestra.devrel
+description: Syncs flows/ from kestraflowstate into a namespace and optionally runs every flow there. See the repo README for setup.
 
 variables:
   repo_url: https://github.com/kestra-io/kestraflowstate

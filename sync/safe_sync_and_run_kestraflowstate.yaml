@@ -1,26 +1,6 @@
-# Checks every flow in flows/ before anything reaches Kestra, then hands off to sync_and_run_kestraflowstate.
-# If one flow fails a check, nothing is synced or run.
-#
-# Checks, run in an Alpine container:
-# - kestractl flows validate: the YAML is a valid flow for this Kestra.
-# - No external code: no scripts.* / docker / kubernetes / ssh / task-runner task types (old
-#   io.kestra.core.tasks.scripts.* aliases included), and no taskRunner or containerImage anywhere.
-# - Task types must start with one of vars.allowed_type_prefixes.
-# - No unapproved external data: every URL outside text fields (description, message, errorMessage,
-#   displayName) must start with one of vars.allowed_url_prefixes. HTTP task URLs may only be literals or
-#   {{ vars.x }}, since anything built at runtime can't be checked.
-# - DuckDB SQL can't INSTALL/ATTACH, load httpfs, or read s3/gcs/azure paths.
-# - Subflow/ForEachItem may only call flows in the flow's own namespace.
-# It's a static scan, so treat it as a gate for obvious problems and keep target_namespace's secrets minimal.
-# AI tasks are allowed (ai.* prefix) and send prompts to their provider.
-#
-# Setup (Kestra 2.0):
-# - Everything sync_and_run_kestraflowstate needs, deployed in the same namespace as this flow.
-# - Plugins: git and script-shell (for the Docker task runner). Docker socket mounted into Kestra.
-# - vars.kestra_url_from_docker must reach the webserver from a sibling container (on Docker Desktop
-#   that's host.docker.internal plus the host port).
 id: safe_sync_and_run_kestraflowstate
 namespace: kestra.devrel
+description: Scans every flow in kestraflowstate for external code and unapproved data sources, then calls sync_and_run_kestraflowstate. See the repo README for setup.
 
 variables:
   repo_url: https://github.com/kestra-io/kestraflowstate
