@@ -4,9 +4,12 @@ Kestra hackathon submission. Workflows are built on the Jaffle Shop dataset and 
 
 ## Run it
 
-[`sync/sync_and_run_kestraflowstate.yaml`](sync/sync_and_run_kestraflowstate.yaml) clones this repo, checks every file in `flows/` with `kestractl flows validate` in a throwaway container, syncs them into a Kestra namespace (`hackathon` by default), then runs each one. Nothing is hardcoded, so new flows in `flows/` get picked up on the next run. Set the `run` input to false to validate and sync only.
+Two flows in [`sync/`](sync/) pull everything in `flows/` into a Kestra namespace (`hackathon` by default) and run it. Neither hardcodes flow names, so new files in `flows/` get picked up. Set the `run` input to false to sync without running.
 
-1. Add the sync flow to Kestra 2.0. The comment at the top of the file lists the plugins, the Docker access and the `KESTRA_API_TOKEN` secret it needs.
-2. Execute it. Each synced flow's description lists any setup of its own.
+- [`sync_and_run_kestraflowstate.yaml`](sync/sync_and_run_kestraflowstate.yaml) syncs and runs, no checks.
+- [`safe_sync_and_run_kestraflowstate.yaml`](sync/safe_sync_and_run_kestraflowstate.yaml) checks every flow in a container first (valid with `kestractl`, no script or container tasks, no data from hosts outside an allowlist), then calls the flow above. One failed check stops the sync.
+
+1. Add both to the same namespace in Kestra 2.0. The comment at the top of each file lists the plugins and the `KESTRA_API_TOKEN` secret they need.
+2. Execute one. Each synced flow's description lists any setup of its own.
 
 You can also import the files in `flows/` by hand and click **Execute** on each one.

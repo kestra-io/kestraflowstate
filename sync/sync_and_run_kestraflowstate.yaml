@@ -1,17 +1,13 @@
-# Clones this repo, validates every flow in flows/ with kestractl inside a Docker container, syncs them
-# into target_namespace, then (optionally) runs each one. Nothing is hardcoded: whatever flows/ holds
-# gets validated, synced and run.
+# Syncs every flow in flows/ into target_namespace, then (optionally) runs every flow in that namespace.
+# No checks: use safe_sync_and_run_kestraflowstate for a version that scans the flows first.
 #
 # Setup (Kestra 2.0):
-# - Plugins: git, script-shell (for the Docker task runner), plus whatever the synced flows use
-#   (the current ones need jdbc-duckdb, serdes and ai). Install them on slim images.
-# - Docker socket mounted into Kestra, since validation runs in its own container.
-# - Secret KESTRA_API_TOKEN in this flow's namespace: SyncFlows and kestractl call the Kestra API with it.
-# - vars.kestra_url must reach the webserver from the Kestra worker; vars.kestra_url_from_docker must reach
-#   it from a sibling container (on Docker Desktop that's host.docker.internal plus the host port).
+# - Plugins: git, plus whatever the synced flows use (the current ones need jdbc-duckdb, serdes and ai).
+# - Secret KESTRA_API_TOKEN in this flow's namespace: SyncFlows and the flow listing call the Kestra API with it.
+# - vars.kestra_url must reach the Kestra webserver from the worker.
 # - Flows run with their input defaults, so a flow with a required input that has no default will fail.
-#   Each run is allowFailure and gets its own Loop iteration, so one failing flow doesn't stop the others
-#   or fail this execution. Check each flow's own execution in target_namespace for its result.
+#   Each run is allowFailure in its own Loop iteration, so one failing flow doesn't stop the others or fail
+#   this execution. Check each flow's own execution in target_namespace for its result.
 id: sync_and_run_kestraflowstate
 namespace: kestra.devrel
 
@@ -19,9 +15,7 @@ variables:
   repo_url: https://github.com/kestra-io/kestraflowstate
   git_directory: flows
   kestra_url: http://localhost:8080
-  kestra_url_from_docker: http://host.docker.internal:8080
   tenant: main
-  kestractl_version: 3.12.2
 
 inputs:
   - id: target_namespace
@@ -34,44 +28,10 @@ inputs:
 
   - id: run
     type: BOOL
-    displayName: Run the synced flows after syncing (off = validate and sync only)
+    displayName: Run the flows after syncing (off = sync only)
     defaults: true
 
 tasks:
-  - id: validate
-    type: io.kestra.plugin.core.flow.WorkingDirectory
-    tasks:
-      - id: clone
-        type: io.kestra.plugin.git.Clone
-        url: "{{ vars.repo_url }}"
-        branch: "{{ inputs.branch }}"
-
-      - id: kestractl_validate
-        type: io.kestra.plugin.scripts.shell.Commands
-        taskRunner:
-          type: io.kestra.plugin.scripts.runner.docker.Docker
-        containerImage: alpine:3.20
-        env:
-          KESTRA_API_TOKEN: "{{ secret('KESTRA_API_TOKEN') }}"
-        commands:
-          - |
-            set -eu
-            case "$(uname -m)" in aarch64|arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
-            wget -qO /usr/local/bin/kestractl \
-              "https://github.com/kestra-io/kestractl/releases/download/v{{ vars.kestractl_version }}/kestractl_{{ vars.kestractl_version }}_linux_${ARCH}"
-            chmod +x /usr/local/bin/kestractl
-
-            kestractl flows validate "{{ vars.git_directory }}" \
-              --host "{{ vars.kestra_url_from_docker }}" --tenant "{{ vars.tenant }}" --token "$KESTRA_API_TOKEN"
-
-            IDS=""
-            for f in $(find "{{ vars.git_directory }}" -name '*.yaml' -o -name '*.yml' | sort); do
-              ID=$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -n 1 | tr -d "\"'\r ")
-              [ -n "$ID" ] && IDS="${IDS:+$IDS,}\"$ID\""
-            done
-            echo "Flows found: [$IDS]"
-            echo "::{\"outputs\":{\"flow_ids\":[$IDS]}}::"
-
   - id: sync_flows
     type: io.kestra.plugin.git.SyncFlows
     url: "{{ vars.repo_url }}"
@@ -82,7 +42,6 @@ tasks:
     gitDirectory: "{{ vars.git_directory }}"
     targetNamespace: "{{ inputs.target_namespace }}"
     includeChildNamespaces: false
-    ignoreInvalidFlows: false
     delete: false
     dryRun: false
 
@@ -90,9 +49,15 @@ tasks:
     type: io.kestra.plugin.core.flow.If
     condition: "{{ inputs.run }}"
     then:
+      - id: list_flows
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ vars.kestra_url }}/api/v1/{{ vars.tenant }}/flows/{{ inputs.target_namespace }}"
+        headers:
+          Authorization: "Bearer {{ secret('KESTRA_API_TOKEN') }}"
+
       - id: run_all
         type: io.kestra.plugin.core.flow.Loop
-        values: "{{ outputs.kestractl_validate.vars.flow_ids }}"
+        values: "{{ outputs.list_flows.body | jq('[.[] | select(.disabled != true) | .id]') | first }}"
         tasks:
           - id: run_flow
             type: io.kestra.plugin.core.flow.Subflow
@@ -105,6 +70,5 @@ tasks:
   - id: log_result
     type: io.kestra.plugin.core.log.Log
     message: |
-      Validated and synced commit {{ outputs.sync_flows.commitId ?? 'unknown' }} into {{ inputs.target_namespace }}.
-      Flows: {{ outputs.kestractl_validate.vars.flow_ids | join(', ') }}
+      Synced commit {{ outputs.sync_flows.commitId ?? 'unknown' }} into {{ inputs.target_namespace }}.
       Run: {{ inputs.run ? 'yes' : 'no, sync only' }}
