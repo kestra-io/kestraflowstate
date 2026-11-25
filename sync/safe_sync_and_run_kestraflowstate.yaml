@@ -1,0 +1,112 @@
+id: safe_sync_and_run_kestraflowstate
+namespace: kestra.devrel
+description: Scans every flow in kestraflowstate for external code and unapproved data sources, then calls sync_and_run_kestraflowstate. See the repo README for setup.
+
+variables:
+  repo_url: https://github.com/kestra-io/kestraflowstate
+  git_directory: flows
+  kestra_url_from_docker: http://host.docker.internal:8080
+  tenant: main
+  kestractl_version: 3.12.2
+  allowed_type_prefixes:
+    - io.kestra.plugin.core.
+    - io.kestra.plugin.jdbc.duckdb.
+    - io.kestra.plugin.serdes.
+    - io.kestra.plugin.ai.
+  allowed_url_prefixes:
+    - https://huggingface.co/datasets/annageller/kestra/
+
+inputs:
+  - id: target_namespace
+    type: STRING
+    defaults: hackathon
+
+  - id: branch
+    type: STRING
+    defaults: main
+
+  - id: run
+    type: BOOL
+    displayName: Run the flows after syncing (off = check and sync only)
+    defaults: true
+
+tasks:
+  - id: check
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone
+        type: io.kestra.plugin.git.Clone
+        url: "{{ vars.repo_url }}"
+        branch: "{{ inputs.branch }}"
+
+      - id: safety_check
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: alpine:3.20
+        env:
+          KESTRA_API_TOKEN: "{{ secret('KESTRA_API_TOKEN') }}"
+          ALLOWED_TYPES: "{{ vars.allowed_type_prefixes | join(' ') }}"
+          ALLOWED_URLS: "{{ vars.allowed_url_prefixes | join(' ') }}"
+          FLOW_DIR: "{{ vars.git_directory }}"
+        commands:
+          - |
+            set -eu
+            apk add -q --no-cache yq-go
+            case "$(uname -m)" in aarch64|arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
+            wget -qO /usr/local/bin/kestractl \
+              "https://github.com/kestra-io/kestractl/releases/download/v{{ vars.kestractl_version }}/kestractl_{{ vars.kestractl_version }}_linux_${ARCH}"
+            chmod +x /usr/local/bin/kestractl
+
+            kestractl flows validate "$FLOW_DIR" \
+              --host "{{ vars.kestra_url_from_docker }}" --tenant "{{ vars.tenant }}" --token "$KESTRA_API_TOKEN"
+
+            BLOCKED='\.scripts\.|\.docker\.|\.kubernetes\.|\.fs\.ssh\.|\.core\.runner\.|\.ansible\.|\.terraform\.'
+            FAIL=0
+            fail() { echo "BLOCKED $1: $2"; FAIL=1; }
+            q() { echo "$J" | yq -p=json "$1" | grep . || true; }
+
+            for f in $(find "$FLOW_DIR" -type f \( -name '*.yaml' -o -name '*.yml' \) | sort); do
+              J=$(yq -o=json 'del(.. | select(tag == "!!map") | (.description, .message, .errorMessage, .displayName))' "$f")
+
+              for t in $(q '.. | select(tag == "!!map" and has("type")) | .type | select(tag == "!!str")' | grep '\.' | sort -u); do
+                if echo "$t" | grep -qE "$BLOCKED"; then fail "$f" "runs external code ($t)"; continue; fi
+                ok=0; for p in $ALLOWED_TYPES; do case "$t" in "$p"*) ok=1 ;; esac; done
+                [ "$ok" = 1 ] || fail "$f" "task type not on the allowlist ($t)"
+              done
+
+              for k in $(q '.. | select(tag == "!!map") | keys | .[]' | grep -xE 'taskRunner|containerImage|docker' | sort -u); do
+                fail "$f" "runs a container or task runner ($k)"
+              done
+
+              for u in $(echo "$J" | grep -oE "https?://[^\"' )>,]+" | sort -u); do
+                ok=0; for p in $ALLOWED_URLS; do case "$u" in "$p"*) ok=1 ;; esac; done
+                [ "$ok" = 1 ] || fail "$f" "external URL not on the allowlist ($u)"
+              done
+
+              for u in $(q '.. | select(tag == "!!map" and has("type")) | select(.type | test("core\.http\.")) | (.uri // .url // "")' | tr -d ' '); do
+                case "$u" in
+                  *'{''{'*) echo "$u" | grep -qE '^\{\{vars\.[A-Za-z0-9_]+\}\}' || fail "$f" "HTTP URL built at runtime ($u)" ;;
+                esac
+              done
+
+              q '.. | select(tag == "!!map" and has("sql")) | .sql' | grep -qiE 'install|attach|httpfs|s3://|gcs://|az://' \
+                && fail "$f" "SQL loads an extension or attaches remote storage"
+
+              q '.. | select(tag == "!!map" and has("type")) | select(.type | test("core\.flow\.(Subflow|ForEachItem)")) | (.namespace // "")' \
+                | grep -vqE '^\{\{ *flow\.namespace *\}\}$' && fail "$f" "calls a flow in another namespace"
+            done
+
+            [ "$FAIL" = 0 ] || exit 1
+            echo "Safety check passed"
+
+  - id: sync_and_run
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: "{{ flow.namespace }}"
+    flowId: sync_and_run_kestraflowstate
+    inputs:
+      target_namespace: "{{ inputs.target_namespace }}"
+      branch: "{{ inputs.branch }}"
+      run: "{{ inputs.run }}"
+    wait: true
+    transmitFailed: true

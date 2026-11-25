@@ -1,0 +1,65 @@
+id: sync_and_run_kestraflowstate
+namespace: kestra.devrel
+description: Syncs flows/ from kestraflowstate into a namespace and optionally runs every flow there. See the repo README for setup.
+
+variables:
+  repo_url: https://github.com/kestra-io/kestraflowstate
+  git_directory: flows
+  kestra_url: http://localhost:8080
+  tenant: main
+
+inputs:
+  - id: target_namespace
+    type: STRING
+    defaults: hackathon
+
+  - id: branch
+    type: STRING
+    defaults: main
+
+  - id: run
+    type: BOOL
+    displayName: Run the flows after syncing (off = sync only)
+    defaults: true
+
+tasks:
+  - id: sync_flows
+    type: io.kestra.plugin.git.SyncFlows
+    url: "{{ vars.repo_url }}"
+    branch: "{{ inputs.branch }}"
+    kestraUrl: "{{ vars.kestra_url }}"
+    auth:
+      apiToken: "{{ secret('KESTRA_API_TOKEN') }}"
+    gitDirectory: "{{ vars.git_directory }}"
+    targetNamespace: "{{ inputs.target_namespace }}"
+    includeChildNamespaces: false
+    delete: false
+    dryRun: false
+
+  - id: maybe_run
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.run }}"
+    then:
+      - id: list_flows
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ vars.kestra_url }}/api/v1/{{ vars.tenant }}/flows/{{ inputs.target_namespace }}"
+        headers:
+          Authorization: "Bearer {{ secret('KESTRA_API_TOKEN') }}"
+
+      - id: run_all
+        type: io.kestra.plugin.core.flow.Loop
+        values: "{{ outputs.list_flows.body | jq('[.[] | select(.disabled != true) | .id]') | first }}"
+        tasks:
+          - id: run_flow
+            type: io.kestra.plugin.core.flow.Subflow
+            namespace: "{{ inputs.target_namespace }}"
+            flowId: "{{ item.value }}"
+            wait: true
+            transmitFailed: true
+            allowFailure: true
+
+  - id: log_result
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Synced commit {{ outputs.sync_flows.commitId ?? 'unknown' }} into {{ inputs.target_namespace }}.
+      Run: {{ inputs.run ? 'yes' : 'no, sync only' }}
