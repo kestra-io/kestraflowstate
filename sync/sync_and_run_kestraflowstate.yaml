@@ -1,0 +1,75 @@
+# Syncs every flow in flows/ into target_namespace, then optionally runs them.
+# Setup (Kestra 2.0):
+# - Plugins: git, jdbc-duckdb, serdes, ai (install them on slim images).
+# - Secret KESTRA_API_TOKEN in this flow's namespace: SyncFlows calls the Kestra API with it.
+# - vars.kestra_url must reach the webserver from where tasks run (inside Docker that's the
+#   container port, not the host port).
+# - Optional: GEMINI_API_KEY in the target namespace's KV Store for the AI flow. Without it that
+#   flow fails fast by design, and allowFailure keeps this parent flow green.
+id: sync_and_run_kestraflowstate
+namespace: kestra.devrel
+
+variables:
+  kestra_url: http://localhost:8080
+
+inputs:
+  - id: target_namespace
+    type: STRING
+    defaults: hackathon
+
+  - id: run
+    type: BOOL
+    displayName: Run the synced flows after syncing (off = sync only)
+    defaults: true
+
+  - id: run_ai_flow
+    type: BOOL
+    displayName: Include the AI flow when running
+    defaults: true
+
+tasks:
+  - id: sync_flows
+    type: io.kestra.plugin.git.SyncFlows
+    url: https://github.com/kestra-io/kestraflowstate
+    branch: main
+    kestraUrl: "{{ vars.kestra_url }}"
+    auth:
+      apiToken: "{{ secret('KESTRA_API_TOKEN') }}"
+    gitDirectory: flows
+    targetNamespace: "{{ inputs.target_namespace }}"
+    includeChildNamespaces: false
+    ignoreInvalidFlows: true
+    delete: false
+    dryRun: false
+
+  - id: maybe_run
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.run }}"
+    then:
+      - id: run_flows
+        type: io.kestra.plugin.core.flow.Parallel
+        tasks:
+          - id: run_insights
+            type: io.kestra.plugin.core.flow.Subflow
+            namespace: "{{ inputs.target_namespace }}"
+            flowId: jaffle_shop_insights_kestra_hackathon
+            wait: true
+            transmitFailed: true
+
+          - id: run_ai_briefing
+            type: io.kestra.plugin.core.flow.If
+            condition: "{{ inputs.run_ai_flow }}"
+            then:
+              - id: run_ai
+                type: io.kestra.plugin.core.flow.Subflow
+                namespace: "{{ inputs.target_namespace }}"
+                flowId: jaffle_shop_insights_kestra_hackathon_ai
+                wait: true
+                transmitFailed: true
+                allowFailure: true
+
+  - id: log_result
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Synced commit {{ outputs.sync_flows.commitId ?? 'unknown' }} into {{ inputs.target_namespace }}.
+      Run: {{ inputs.run ? 'yes, insights execution ' ~ (outputs.run_insights.executionId ?? 'unknown') : 'no, sync only' }}
