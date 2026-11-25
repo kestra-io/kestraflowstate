@@ -1,10 +1,8 @@
 # kestraflowstate
 
-Kestra hackathon starter flows built on the Jaffle Shop dataset. Flows live in [`flows/`](flows/).
+Kestra hackathon submission. Workflows are built on the Jaffle Shop dataset and live in [`flows/`](flows/).
 
-| File | Flow ID | What it does |
-|---|---|---|
-| `flows/jaffle_shop_insights_kestra_hackathon.yaml` | `jaffle_shop_insights_kestra_hackathon` | Downloads the dataset, analyzes it with DuckDB, logs a business overview and store leaderboard, outputs a product profitability CSV. No setup needed. |
-| `flows/jaffle_shop_insights_kestra_hackathon_ai.yaml` | `jaffle_shop_insights_kestra_hackathon_ai` | Compares two sales periods in DuckDB, asks Gemini for a briefing and a structured alert level, then branches on it. Needs `GEMINI_API_KEY` in the namespace KV Store. |
+## Run it
 
-To sync them into Kestra, point `io.kestra.plugin.git.SyncFlows` at this repo with `gitDirectory: flows`.
+1. Import the YAML files from `flows/` into Kestra, or sync them with `io.kestra.plugin.git.SyncFlows` using `gitDirectory: flows`.
+2. Open a flow and click **Execute**. Each flow's description lists any setup it needs.
