@@ -1,0 +1,287 @@
+id: hackathon_infra
+namespace: kestra.devrel
+
+
+description: |
+  Kestra hackathon starter flow (Infrastructure track): Kubernetes manifest audit.
+
+  Pulls a sample of real-world Kubernetes manifests from public GitHub repos
+  (Hugging Face dataset `substratusai/the-stack-yaml-k8s`, 276k files) and runs
+  them through a mini CI pipeline:
+    1. schema validation with kubeconform (catches typos, wrong apiVersions, bad fields),
+    2. security & reliability checks (privileged pods, hostNetwork, hostPath,
+       plaintext secrets, unpinned images, missing limits and probes),
+    3. a CSV report plus an optional policy gate that fails the run on HIGH findings.
+
+  No credentials or cluster needed. Each step runs in its own Docker container,
+  which works with Kestra's standard Docker Compose setup.
+
+labels:
+  event: hackathon
+  track: infrastructure
+  dataset: the-stack-yaml-k8s
+
+inputs:
+  - id: sample_size
+    type: INT
+    displayName: Number of manifests to audit
+    description: The Hugging Face API returns at most 100 rows per request.
+    defaults: 25
+    min: 1
+    max: 100
+
+  - id: offset
+    type: INT
+    displayName: Where to start in the dataset (0 - 276,000)
+    description: Change this to audit a different slice of the 276k manifests.
+    defaults: 0
+    min: 0
+    max: 276000
+
+  - id: fail_on_high
+    type: BOOL
+    displayName: Fail the execution if HIGH findings are detected (policy gate)
+    defaults: false
+
+variables:
+  dataset_api: https://datasets-server.huggingface.co/rows?dataset=substratusai/the-stack-yaml-k8s&config=default&split=train
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # STEP 1 - FETCH: call the Hugging Face dataset API and save the JSON response.
+  # ---------------------------------------------------------------------------
+  - id: fetch_manifests
+    type: io.kestra.plugin.core.http.Download
+    uri: "{{ vars.dataset_api }}&offset={{ inputs.offset }}&length={{ inputs.sample_size }}"
+
+  # ---------------------------------------------------------------------------
+  # STEP 2 - AUDIT: the tasks below share one working directory, like steps in a
+  # CI job, so files written by one task are visible to the next.
+  # Each task runs in its own container image (Docker task runner).
+  # ---------------------------------------------------------------------------
+  - id: audit_pipeline
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      # 2a. Turn the API response into one .yaml file per manifest.
+      - id: write_manifests
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.13-slim
+        inputFiles:
+          rows.json: "{{ outputs.fetch_manifests.uri }}"
+        script: |
+          import json, os, re
+
+          os.makedirs("manifests", exist_ok=True)
+          with open("rows.json") as f:
+              rows = json.load(f)["rows"]
+
+          index = {}
+          for i, item in enumerate(rows):
+              row = item["row"]
+              base = os.path.basename(row.get("max_stars_repo_path") or "manifest.yaml")
+              base = re.sub(r"[^A-Za-z0-9._-]", "_", base)
+              if not base.endswith((".yaml", ".yml")):
+                  base += ".yaml"
+              name = f"{i:03d}_{base}"
+              with open(os.path.join("manifests", name), "w") as out:
+                  out.write(row["content"])
+              index[name] = {
+                  "repo": row.get("max_stars_repo_name"),
+                  "path": row.get("max_stars_repo_path"),
+                  "licenses": ",".join(row.get("max_stars_repo_licenses") or []),
+              }
+
+          with open("index.json", "w") as f:
+              json.dump(index, f, indent=2)
+          print(f"Wrote {len(index)} manifests to ./manifests")
+
+      # 2b. Schema validation. kubeconform is installed on the fly in an Alpine
+      # container (works on both amd64 and arm64 hosts, e.g. Apple Silicon).
+      # It exits non-zero when manifests are invalid, so we keep going with `|| true`
+      # and let the audit step decide what to report.
+      - id: validate_schemas
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: alpine:3.20
+        commands:
+          - ARCH=$(uname -m); case "$ARCH" in aarch64|arm64) ARCH=arm64 ;; *) ARCH=amd64 ;; esac
+          - wget -qO- "https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-$ARCH.tar.gz" | tar xz -C /tmp
+          - /tmp/kubeconform -strict -ignore-missing-schemas -summary manifests/ || true
+          - /tmp/kubeconform -strict -ignore-missing-schemas -output json -verbose manifests/ > kubeconform.json || true
+
+      # 2c. Security & reliability checks + merge with schema results into a report.
+      - id: audit
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.13-slim
+        dependencies:
+          - pyyaml
+        outputFiles:
+          - report.csv
+        script: |
+          import csv, json, os, re
+          import yaml
+
+          # --- 1. Schema validation results from kubeconform ------------------------
+          schema = {}  # file name -> list of (kind, name, status, message)
+          try:
+              with open("kubeconform.json") as f:
+                  for r in json.load(f).get("resources", []):
+                      fname = os.path.basename(r.get("filename", ""))
+                      schema.setdefault(fname, []).append(
+                          (r.get("kind", ""), r.get("name", ""), r.get("status", ""), r.get("msg", ""))
+                      )
+          except (FileNotFoundError, json.JSONDecodeError):
+              print("No kubeconform results found, skipping schema results")
+
+          with open("index.json") as f:
+              index = json.load(f)
+
+          # --- 2. Security & reliability checks -------------------------------------
+          SECRET_ENV = re.compile(r"PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY", re.I)
+
+          def pod_spec(doc):
+              """Return the pod spec for any workload kind, or None."""
+              kind = doc.get("kind")
+              spec = doc.get("spec") or {}
+              if kind == "Pod":
+                  return spec
+              if kind in ("Deployment", "StatefulSet", "DaemonSet", "ReplicaSet", "Job", "ReplicationController"):
+                  return (spec.get("template") or {}).get("spec")
+              if kind == "CronJob":
+                  return (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec")
+              return None
+
+          def check(doc):
+              findings = []  # (severity, check, detail)
+              kind = doc.get("kind")
+              if kind == "Secret" and (doc.get("data") or doc.get("stringData")):
+                  findings.append(("HIGH", "secret-in-git", "Secret values are committed to the repository"))
+              spec = pod_spec(doc)
+              if not isinstance(spec, dict):
+                  return findings
+              if spec.get("hostNetwork"):
+                  findings.append(("HIGH", "host-network", "Pod shares the node's network namespace"))
+              if spec.get("hostPID"):
+                  findings.append(("HIGH", "host-pid", "Pod can see all processes on the node"))
+              for vol in spec.get("volumes") or []:
+                  if isinstance(vol, dict) and "hostPath" in vol:
+                      findings.append(("HIGH", "host-path-volume", f"Volume '{vol.get('name')}' mounts a path from the node"))
+              containers = (spec.get("containers") or []) + (spec.get("initContainers") or [])
+              for c in containers:
+                  if not isinstance(c, dict):
+                      continue
+                  cname = c.get("name", "?")
+                  sc = c.get("securityContext") or {}
+                  if sc.get("privileged"):
+                      findings.append(("HIGH", "privileged-container", f"Container '{cname}' runs privileged"))
+                  for env in c.get("env") or []:
+                      if isinstance(env, dict) and "value" in env and SECRET_ENV.search(str(env.get("name", ""))):
+                          findings.append(("HIGH", "plaintext-secret-env", f"Container '{cname}' sets {env.get('name')} in plain text"))
+                  image = str(c.get("image", ""))
+                  last = image.split("/")[-1]
+                  if image and "@" not in image and (":" not in last or last.endswith(":latest")):
+                      findings.append(("MEDIUM", "unpinned-image", f"Container '{cname}' uses '{image}' (no tag or :latest)"))
+                  if not (c.get("resources") or {}).get("limits"):
+                      findings.append(("MEDIUM", "no-resource-limits", f"Container '{cname}' has no CPU/memory limits"))
+                  if kind != "Job" and kind != "CronJob" and not c.get("livenessProbe") and c in (spec.get("containers") or []):
+                      findings.append(("LOW", "no-liveness-probe", f"Container '{cname}' has no liveness probe"))
+              return findings
+
+          rows = []
+          for fname in sorted(index):
+              meta = index[fname]
+              statuses = schema.get(fname, [])
+              schema_status = "valid"
+              if any(s[2] in ("statusInvalid", "statusError") for s in statuses):
+                  schema_status = "invalid"
+              elif statuses and all(s[2] == "statusSkipped" for s in statuses):
+                  schema_status = "skipped"
+              for kind, name, status, msg in statuses:
+                  if status in ("statusInvalid", "statusError"):
+                      rows.append([fname, meta["repo"], kind, name, schema_status, "HIGH", "schema-invalid", msg[:300]])
+              try:
+                  with open(os.path.join("manifests", fname)) as f:
+                      docs = [d for d in yaml.safe_load_all(f) if isinstance(d, dict)]
+              except yaml.YAMLError:
+                  rows.append([fname, meta["repo"], "", "", "unparseable", "MEDIUM", "yaml-parse-error",
+                               "Not valid YAML (often an unrendered Helm or Jinja template)"])
+                  continue
+              for doc in docs:
+                  name = (doc.get("metadata") or {}).get("name", "")
+                  for sev, chk, detail in check(doc):
+                      rows.append([fname, meta["repo"], doc.get("kind", ""), name, schema_status, sev, chk, detail])
+
+          # --- 3. Report & outputs ---------------------------------------------------
+          order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+          rows.sort(key=lambda r: (order[r[5]], r[0]))
+          with open("report.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["file", "repo", "kind", "name", "schema_status", "severity", "check", "detail"])
+              w.writerows(rows)
+
+          counts = {s: sum(1 for r in rows if r[5] == s) for s in order}
+          files_with_high = len({r[0] for r in rows if r[5] == "HIGH"})
+          top_checks = {}
+          for r in rows:
+              top_checks[r[6]] = top_checks.get(r[6], 0) + 1
+          outputs = {
+              "files_scanned": len(index),
+              "files_with_high": files_with_high,
+              "high": counts["HIGH"],
+              "medium": counts["MEDIUM"],
+              "low": counts["LOW"],
+              "top_checks": sorted(top_checks.items(), key=lambda kv: -kv[1])[:5],
+              "top_high_findings": [f"{r[0]} ({r[2]} {r[3]}): {r[7]}" for r in rows if r[5] == "HIGH"][:5],
+          }
+          print(json.dumps(outputs, indent=2))
+          # Kestra reads lines in this format and exposes them as task outputs (outputs.audit.vars)
+          print("::" + json.dumps({"outputs": outputs}) + "::")
+
+  # ---------------------------------------------------------------------------
+  # STEP 3 - REPORT: summary in the Logs tab (outputs.audit.vars come from the
+  # "::{...}::" line printed by the audit script).
+  # ---------------------------------------------------------------------------
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      KUBERNETES MANIFEST AUDIT (offset {{ inputs.offset }}, {{ outputs.audit.vars.files_scanned }} files)
+      Findings: {{ outputs.audit.vars.high }} HIGH / {{ outputs.audit.vars.medium }} MEDIUM / {{ outputs.audit.vars.low }} LOW
+      Files with at least one HIGH finding: {{ outputs.audit.vars.files_with_high }}
+
+      Most frequent issues:
+      {%- for c in outputs.audit.vars.top_checks %}
+        - {{ c[0] }}: {{ c[1] }}
+      {%- endfor %}
+
+      Top HIGH findings:
+      {%- for f in outputs.audit.vars.top_high_findings %}
+        - {{ f }}
+      {%- endfor %}
+
+      Full report: Outputs tab > audit_report
+
+  # ---------------------------------------------------------------------------
+  # STEP 4 - POLICY GATE: like a CI check, fail the run on HIGH findings if asked.
+  # ---------------------------------------------------------------------------
+  - id: policy_gate
+    type: io.kestra.plugin.core.execution.Fail
+    condition: "{{ inputs.fail_on_high and outputs.audit.vars.high > 0 }}"
+    errorMessage: "Policy gate failed: {{ outputs.audit.vars.high }} HIGH findings in {{ outputs.audit.vars.files_with_high }} files. See audit_report."
+
+outputs:
+  - id: audit_report
+    type: FILE
+    value: "{{ outputs.audit.outputFiles['report.csv'] }}"
+
+# Disabled by default: set `disabled: false` to audit a new slice every night.
+triggers:
+  - id: nightly_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 2 * * *"
+    disabled: true
+
