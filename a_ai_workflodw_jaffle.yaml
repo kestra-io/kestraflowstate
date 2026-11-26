@@ -6,7 +6,7 @@ description: |
   Kestra hackathon starter flow (AI track): Jaffle Shop AI briefing.
 
   The flow crunches the latest Jaffle Shop sales with DuckDB, then asks an AI model
-  (Google Gemini) to act as a business analyst. The model returns:
+  (Google Gemini) to act as a business anadlyst. The model returns:
     - a written briefing for the store managers, in the language you choose,
     - a structured verdict: which store needs attention and how urgent it is.
   Kestra then uses that verdict to decide what to do next (a raised alert or a routine log).
